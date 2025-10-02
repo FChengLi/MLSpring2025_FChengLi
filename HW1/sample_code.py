@@ -53,31 +53,55 @@ class COVID19Dataset(Dataset):
     def __len__(self):
         return self.x.shape[0]
 
-# ====== Simple MLP ======
+# ====== Stronger Residual MLP ======
+class ResidualBlock(nn.Module):
+    def __init__(self, dim, drop=0.2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Dropout(drop),
+            nn.Linear(dim, dim),
+            nn.GELU(),
+        )
+        self.norm = nn.BatchNorm1d(dim)
+
+    def forward(self, x):
+        out = self.net(x)
+        out = self.norm(out + x)  # 残差 + BN
+        return out
+
 class My_Model(nn.Module):
     def __init__(self, input_dim: int):
         super().__init__()
-        # 稍加宽并加入轻微 Dropout 与 BatchNorm 提升稳定性
-        self.layers = nn.Sequential(
-            nn.Linear(input_dim, 64),
+        hidden = 128
+        self.stem = nn.Sequential(
+            nn.Linear(input_dim, hidden),
+            nn.BatchNorm1d(hidden),
+            nn.GELU(),
+            nn.Dropout(0.1),
+        )
+        self.block1 = ResidualBlock(hidden, drop=0.2)
+        self.block2 = ResidualBlock(hidden, drop=0.2)
+        self.mid = nn.Sequential(
+            nn.Linear(hidden, 64),
             nn.BatchNorm1d(64),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Dropout(0.1),
-
-            nn.Linear(64, 32),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-
-            nn.Linear(32, 16),
-            nn.ReLU(),
-
-            nn.Linear(16, 1)
+        )
+        self.head = nn.Sequential(
+            nn.Linear(64, 64),
+            nn.GELU(),
+            nn.Linear(64, 1),
         )
 
     def forward(self, x):
-        out = self.layers(x)            # (B, 1)
-        return out.squeeze(1)           # -> (B,)
+        x = self.stem(x)
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.mid(x)
+        x = self.head(x)
+        return x.squeeze(1)
 
 # ====== Feature selection ======
 def select_feat(train_data, valid_data, test_data, select_all=True, keep_idx=None):
@@ -99,17 +123,19 @@ def select_feat(train_data, valid_data, test_data, select_all=True, keep_idx=Non
 
     return raw_x_train[:, feat_idx], raw_x_valid[:, feat_idx], raw_x_test[:, feat_idx], y_train, y_valid
 
-# ====== Standardize ======
-class Standardizer:
-    """简单的标准化器：(x - mean) / std（避免使用外部库，便于比赛打包）"""
-    def fit(self, x: np.ndarray):
-        self.mean_ = x.mean(axis=0, keepdims=True)
-        self.std_  = x.std(axis=0, keepdims=True) + 1e-8
+# ====== Target Standardizer ======
+class YStandardizer:
+    """仅对 y 做标准化： z = (y - mean) / std； 预测再反标准化。"""
+    def fit(self, y: np.ndarray):
+        y = y.reshape(-1, 1)
+        self.mean_ = y.mean(axis=0, keepdims=True)
+        self.std_  = y.std(axis=0, keepdims=True) + 1e-8
         return self
-    def transform(self, x: np.ndarray):
-        return (x - self.mean_) / self.std_
-    def fit_transform(self, x: np.ndarray):
-        return self.fit(x).transform(x)
+    def transform(self, y: np.ndarray):
+        return ((y.reshape(-1,1) - self.mean_) / self.std_).reshape(-1)
+    def inverse_transform(self, z: np.ndarray):
+        return (z.reshape(-1,1) * self.std_ + self.mean_).reshape(-1)
+
 
 # ====== Train one model ======
 def trainer(train_loader, valid_loader, model, config, device):
@@ -120,7 +146,7 @@ def trainer(train_loader, valid_loader, model, config, device):
         weight_decay=config.get('weight_decay', 1e-4)
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=50, verbose=False
+        optimizer, mode='min', factor=0.5, patience=25, verbose=False
     )
 
     writer = SummaryWriter(log_dir=config.get('log_dir', None))
@@ -177,6 +203,15 @@ def trainer(train_loader, valid_loader, model, config, device):
             if early_stop_count >= config['early_stop']:
                 print('Early stopping: validation did not improve.')
                 break
+def kfold_indices(n_samples, n_splits=5, seed=42):
+    rng = np.random.default_rng(seed)
+    idx = np.arange(n_samples)
+    rng.shuffle(idx)
+    folds = np.array_split(idx, n_splits)
+    for k in range(n_splits):
+        valid_idx = folds[k]
+        train_idx = np.concatenate([folds[i] for i in range(n_splits) if i != k])
+        yield train_idx, valid_idx
 
 # ====== Inference ======
 @torch.no_grad()
@@ -189,6 +224,16 @@ def predict(test_loader, model, device):
         pred = model(x)
         preds.append(pred.detach().cpu())
     return torch.cat(preds, dim=0).numpy()
+# ====== Standardize X (features) ======
+class Standardizer:
+    def fit(self, x: np.ndarray):
+        self.mean_ = x.mean(axis=0, keepdims=True)
+        self.std_  = x.std(axis=0, keepdims=True) + 1e-8
+        return self
+    def transform(self, x: np.ndarray):
+        return (x - self.mean_) / self.std_
+    def fit_transform(self, x: np.ndarray):
+        return self.fit(x).transform(x)
 
 def save_pred(preds, file):
     """按 Kaggle 要求保存预测结果。"""
@@ -203,13 +248,13 @@ if __name__ == "__main__":
         'seed': 5201314,
         'select_all': True,
         'valid_ratio': 0.2,
-        'n_epochs': 2000,
-        'batch_size': 256,
+        'n_epochs': 1500,
+        'batch_size': 256,  # ← 补上
         'learning_rate': 1e-3,
-        'weight_decay': 1e-4,
-        'early_stop': 200,
+        'weight_decay': 2e-4,
+        'early_stop': 120,  # ← 保留一个，按你想要的值
         'save_path': './models/model.ckpt',
-        'log_dir': './runs/hw1_baseline_adamw'
+        'log_dir': './runs/hw1_residual_adamw'
     }
 
     same_seed(config['seed'])
@@ -237,18 +282,23 @@ if __name__ == "__main__":
     # 3) 选特征
     x_train, x_valid, x_test, y_train, y_valid = select_feat(train_arr, valid_arr, test_data, config['select_all'])
 
-    # 4) 标准化（fit 在训练集，transform 在验证/测试）
+    # 4) 标准化 X
     scaler = Standardizer()
     x_train = scaler.fit_transform(x_train)
     x_valid = scaler.transform(x_valid)
-    x_test  = scaler.transform(x_test)
+    x_test = scaler.transform(x_test)
+
+    # 4.1) 标准化 y（只用于训练/验证的损失）
+    ys = YStandardizer()
+    y_train_z = ys.fit(y_train).transform(y_train)
+    y_valid_z = ys.transform(y_valid)
 
     print(f'number of features: {x_train.shape[1]}')
 
     # 5) DataLoader
-    train_ds = COVID19Dataset(x_train, y_train)
-    valid_ds = COVID19Dataset(x_valid, y_valid)
-    test_ds  = COVID19Dataset(x_test)
+    train_ds = COVID19Dataset(x_train, y_train_z)
+    valid_ds = COVID19Dataset(x_valid, y_valid_z)
+    test_ds = COVID19Dataset(x_test)
 
     train_loader = DataLoader(train_ds, batch_size=config['batch_size'], shuffle=True,  pin_memory=True)
     valid_loader = DataLoader(valid_ds, batch_size=config['batch_size'], shuffle=False, pin_memory=True)
@@ -260,8 +310,11 @@ if __name__ == "__main__":
 
     # 7) 推断（加载最佳权重）
     best_model = My_Model(input_dim=x_train.shape[1]).to(device)
-    best_model.load_state_dict(torch.load(config['save_path'], map_location=device))
-    preds = predict(test_loader, best_model, device)
+    best_model.load_state_dict(
+        torch.load(config['save_path'], map_location=device, weights_only=True)
+    )
+    preds_z = predict(test_loader, best_model, device)  # 标准化空间的输出
+    preds = ys.inverse_transform(preds_z)  # 反标准化回原标度
 
     # 8) 保存提交文件
     save_pred(preds, 'pred.csv')
