@@ -1,13 +1,20 @@
 # ====== Imports ======
-import math, os, csv
+import math, os, csv, warnings
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
+# Pytorch
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+
+# TensorBoard（可关）
 from torch.utils.tensorboard import SummaryWriter
+
+# Feature selection（对齐示例）
+from sklearn.feature_selection import SelectKBest, f_regression
+warnings.filterwarnings("ignore", category=UserWarning)
 
 # ====== Reproducibility ======
 def same_seed(seed: int):
@@ -18,15 +25,10 @@ def same_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    # 可选：更强确定性（可能降低速度/报不支持的算子）
-    # torch.use_deterministic_algorithms(True)
 
-# ====== Split (index-based, zero-copy) ======
+# ====== Split (index-based) ======
 def train_valid_split_np(arr: np.ndarray, valid_ratio: float, seed: int):
-    """
-    对 numpy 数组按行进行随机划分，返回两个 numpy 视图（通过索引切分，无多余拷贝）。
-    arr: (N, D) 训练原始矩阵
-    """
+    """按行随机划分为 train/valid。"""
     N = len(arr)
     n_valid = int(round(valid_ratio * N))
     rng = np.random.default_rng(seed)
@@ -43,8 +45,7 @@ class COVID19Dataset(Dataset):
     y: np.ndarray or torch.FloatTensor, shape (N,) or None
     """
     def __init__(self, x, y=None):
-        x = torch.as_tensor(x, dtype=torch.float32)
-        self.x = x
+        self.x = torch.as_tensor(x, dtype=torch.float32)
         self.y = None if y is None else torch.as_tensor(y, dtype=torch.float32)
 
     def __getitem__(self, idx):
@@ -53,104 +54,62 @@ class COVID19Dataset(Dataset):
     def __len__(self):
         return self.x.shape[0]
 
-# ====== Stronger Residual MLP ======
-class ResidualBlock(nn.Module):
-    def __init__(self, dim, drop=0.2):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.GELU(),
-            nn.Dropout(drop),
-            nn.Linear(dim, dim),
-            nn.GELU(),
-        )
-        self.norm = nn.BatchNorm1d(dim)
-
-    def forward(self, x):
-        out = self.net(x)
-        out = self.norm(out + x)  # 残差 + BN
-        return out
-
+# ====== Simple MLP（对齐示例容量；宽度由 config['layer'] 控制）======
 class My_Model(nn.Module):
-    def __init__(self, input_dim: int):
+    def __init__(self, input_dim: int, hidden1: int, hidden2: int):
         super().__init__()
-        hidden = 128
-        self.stem = nn.Sequential(
-            nn.Linear(input_dim, hidden),
-            nn.BatchNorm1d(hidden),
-            nn.GELU(),
-            nn.Dropout(0.1),
-        )
-        self.block1 = ResidualBlock(hidden, drop=0.2)
-        self.block2 = ResidualBlock(hidden, drop=0.2)
-        self.mid = nn.Sequential(
-            nn.Linear(hidden, 64),
-            nn.BatchNorm1d(64),
-            nn.GELU(),
-            nn.Dropout(0.1),
-        )
-        self.head = nn.Sequential(
-            nn.Linear(64, 64),
-            nn.GELU(),
-            nn.Linear(64, 1),
+        self.layers = nn.Sequential(
+            nn.Linear(input_dim, hidden1),
+            nn.ReLU(),
+            nn.Linear(hidden1, hidden2),
+            nn.ReLU(),
+            nn.Linear(hidden2, 1),
         )
 
     def forward(self, x):
-        x = self.stem(x)
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.mid(x)
-        x = self.head(x)
-        return x.squeeze(1)
+        out = self.layers(x)
+        return out.squeeze(1)
 
-# ====== Feature selection ======
-def select_feat(train_data, valid_data, test_data, select_all=True, keep_idx=None):
+# ====== Feature selection（对齐示例：KBest）======
+def select_feat(train_data, valid_data, test_data, use_kbest=True, k=16):
     """
-    选择用于回归的特征列并返回 (x_train, x_valid, x_test, y_train, y_valid)。
+    返回 (x_train, x_valid, x_test, y_train, y_valid)。
     - 约定标签在最后一列。
-    - keep_idx: 显式保留的特征列索引列表（相对于 raw_x_*）。
+    - use_kbest=False 时使用全部特征；True 时使用 SelectKBest(f_regression, k)
     """
     y_train, y_valid = train_data[:, -1], valid_data[:, -1]
     raw_x_train, raw_x_valid, raw_x_test = train_data[:, :-1], valid_data[:, :-1], test_data
 
-    if select_all:
+    if not use_kbest:
         feat_idx = list(range(raw_x_train.shape[1]))
-    elif keep_idx is not None:
-        feat_idx = list(keep_idx)
     else:
-        # 示例：跳过前 35 列 state one-hot，只用行为/症状等连续特征
-        feat_idx = list(range(35, raw_x_train.shape[1]))
+        selector = SelectKBest(score_func=f_regression, k=k)
+        selector.fit(raw_x_train, y_train)
+        idx = np.argsort(selector.scores_)[::-1]
+        feat_idx = list(np.sort(idx[:k]))
 
     return raw_x_train[:, feat_idx], raw_x_valid[:, feat_idx], raw_x_test[:, feat_idx], y_train, y_valid
 
-# ====== Target Standardizer ======
-class YStandardizer:
-    """仅对 y 做标准化： z = (y - mean) / std； 预测再反标准化。"""
-    def fit(self, y: np.ndarray):
-        y = y.reshape(-1, 1)
-        self.mean_ = y.mean(axis=0, keepdims=True)
-        self.std_  = y.std(axis=0, keepdims=True) + 1e-8
-        return self
-    def transform(self, y: np.ndarray):
-        return ((y.reshape(-1,1) - self.mean_) / self.std_).reshape(-1)
-    def inverse_transform(self, z: np.ndarray):
-        return (z.reshape(-1,1) * self.std_ + self.mean_).reshape(-1)
+# ====== Train one model（MSE + SGD/Adam；对齐示例）======
+def trainer(train_loader, valid_loader, model, config, device, valid_scores_ref):
+    criterion = nn.MSELoss(reduction='mean')
 
+    if config['optim'] == 'SGD':
+        if config['no_momentum']:
+            optimizer = torch.optim.SGD(model.parameters(),
+                                        lr=config['learning_rate'],
+                                        weight_decay=config['weight_decay'])
+        else:
+            optimizer = torch.optim.SGD(model.parameters(),
+                                        lr=config['learning_rate'],
+                                        momentum=config['momentum'],
+                                        weight_decay=config['weight_decay'])
+    else:
+        optimizer = torch.optim.Adam(model.parameters(),
+                                     lr=config['learning_rate'],
+                                     weight_decay=config['weight_decay'])
 
-# ====== Train one model ======
-def trainer(train_loader, valid_loader, model, config, device):
-    criterion = nn.MSELoss(reduction='mean')              # 任务指定 MSE
-    optimizer = torch.optim.AdamW(                        # 更稳的默认选择
-        model.parameters(),
-        lr=config['learning_rate'],
-        weight_decay=config.get('weight_decay', 1e-4)
-    )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=25, verbose=False
-    )
-
-    writer = SummaryWriter(log_dir=config.get('log_dir', None))
-
+    writer = None if config['no_tensorboard'] else SummaryWriter()
     os.makedirs(os.path.dirname(config['save_path']), exist_ok=True)
 
     n_epochs = config['n_epochs']
@@ -162,18 +121,16 @@ def trainer(train_loader, valid_loader, model, config, device):
         # ---- train ----
         model.train()
         loss_record = []
-        for x, y in tqdm(train_loader, leave=False):
+        for x, y in train_loader:
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
             pred = model(x)
             loss = criterion(pred, y)
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)  # 防爆梯
             optimizer.step()
             step += 1
             loss_record.append(loss.detach().item())
         mean_train_loss = float(np.mean(loss_record))
-        writer.add_scalar('Loss/train', mean_train_loss, step)
 
         # ---- validate ----
         model.eval()
@@ -184,39 +141,35 @@ def trainer(train_loader, valid_loader, model, config, device):
                 pred = model(x)
                 val_losses.append(criterion(pred, y).item())
         mean_valid_loss = float(np.mean(val_losses))
-        rmse = math.sqrt(mean_valid_loss)
-        writer.add_scalar('Loss/valid', mean_valid_loss, step)
-        writer.add_scalar('Metric/RMSE', rmse, step)
-        print(f'Epoch [{epoch}/{n_epochs}] '
-              f'Train MSE: {mean_train_loss:.6f} | Valid MSE: {mean_valid_loss:.6f} (RMSE {rmse:.5f})')
 
-        scheduler.step(mean_valid_loss)
+        if writer:
+            writer.add_scalar('Loss/train', mean_train_loss, step)
+            writer.add_scalar('Loss/valid', mean_valid_loss, step)
 
-        # ---- save & early stop ----
-        if mean_valid_loss < best_loss - 1e-7:
+        # 保存策略与示例一致：仅当当前折是最优时覆盖
+        if mean_valid_loss < best_loss - 1e-12:
             best_loss = mean_valid_loss
-            torch.save(model.state_dict(), config['save_path'])
+            if len(valid_scores_ref):
+                if best_loss < min(valid_scores_ref):
+                    torch.save(model.state_dict(), config['save_path'])
+                    print(f'  ↳ Saved model (val={best_loss:.4f})')
+            else:
+                torch.save(model.state_dict(), config['save_path'])
+                print(f'  ↳ Saved model (val={best_loss:.4f})')
             early_stop_count = 0
-            print(f'  ↳ Saved best model (MSE={best_loss:.6f})')
         else:
             early_stop_count += 1
             if early_stop_count >= config['early_stop']:
-                print('Early stopping: validation did not improve.')
+                print(f'Best val {best_loss:.4f}. Early stop.')
                 break
-def kfold_indices(n_samples, n_splits=5, seed=42):
-    rng = np.random.default_rng(seed)
-    idx = np.arange(n_samples)
-    rng.shuffle(idx)
-    folds = np.array_split(idx, n_splits)
-    for k in range(n_splits):
-        valid_idx = folds[k]
-        train_idx = np.concatenate([folds[i] for i in range(n_splits) if i != k])
-        yield train_idx, valid_idx
 
-# ====== Inference ======
+    if writer:
+        writer.close()
+    return best_loss
+
+# ====== Predict ======
 @torch.no_grad()
 def predict(test_loader, model, device):
-    """评估模式下批量推断，返回 numpy 数组 shape (N,)."""
     model.eval()
     preds = []
     for x in tqdm(test_loader):
@@ -224,100 +177,127 @@ def predict(test_loader, model, device):
         pred = model(x)
         preds.append(pred.detach().cpu())
     return torch.cat(preds, dim=0).numpy()
-# ====== Standardize X (features) ======
-class Standardizer:
-    def fit(self, x: np.ndarray):
-        self.mean_ = x.mean(axis=0, keepdims=True)
-        self.std_  = x.std(axis=0, keepdims=True) + 1e-8
-        return self
-    def transform(self, x: np.ndarray):
-        return (x - self.mean_) / self.std_
-    def fit_transform(self, x: np.ndarray):
-        return self.fit(x).transform(x)
 
+# ====== Save predictions ======
 def save_pred(preds, file):
-    """按 Kaggle 要求保存预测结果。"""
     with open(file, 'w', newline='') as fp:
         writer = csv.writer(fp)
         writer.writerow(['id', 'tested_positive'])
         for i, p in enumerate(preds):
             writer.writerow([i, float(p)])
+
+# ====== Objective（保留示例风格：K 折 + 可选标准化 + KBest）======
+def objective():
+    global training_data, test_data, valid_scores, config
+
+    print(f'''hyper-parameter: 
+        optimizer: {config['optim']},
+        lr: {config['learning_rate']}, 
+        batch_size: {config['batch_size']}, 
+        k: {config['k']}, 
+        layer: {config['layer']}''')
+
+    valid_scores = []
+    kfold = int(1 / config['valid_ratio'])
+    num_valid_samples = len(training_data) // kfold
+
+    # 打乱一次，和示例保持一致的行为
+    rng = np.random.default_rng(config['seed'])
+    shuffled = training_data[rng.permutation(len(training_data))]
+
+    for fold in range(kfold):
+        # Data split
+        valid_data = shuffled[num_valid_samples * fold : num_valid_samples * (fold + 1)]
+        train_data = np.concatenate((
+            shuffled[:num_valid_samples * fold],
+            shuffled[num_valid_samples * (fold + 1):]
+        ), axis=0)
+
+        # Normalization（默认关闭，对齐示例：no_normal=True）
+        if not config['no_normal']:
+            train_mean = np.mean(train_data[:, 35:-1], axis=0)
+            train_std  = np.std(train_data[:, 35:-1], axis=0) + 1e-8
+            train_data[:, 35:-1] = (train_data[:, 35:-1] - train_mean) / train_std
+            valid_data[:, 35:-1] = (valid_data[:, 35:-1] - train_mean) / train_std
+            test_data[:,  35:  ] = (test_data[:,  35:  ] - train_mean) / train_std
+
+        # Feature selection（KBest）
+        x_train, x_valid, x_test, y_train, y_valid = select_feat(
+            train_data, valid_data, test_data,
+            use_kbest=config['no_select_all'], k=config['k']
+        )
+
+        # Datasets
+        train_ds = COVID19Dataset(x_train, y_train)
+        valid_ds = COVID19Dataset(x_valid, y_valid)
+        test_ds  = COVID19Dataset(x_test)
+
+        # DataLoaders（对齐示例：valid_loader 也 shuffle=True）
+        train_loader = DataLoader(train_ds, batch_size=config['batch_size'], shuffle=True,  pin_memory=True)
+        valid_loader = DataLoader(valid_ds, batch_size=config['batch_size'], shuffle=True,  pin_memory=True)
+        test_loader  = DataLoader(test_ds,  batch_size=config['batch_size'], shuffle=False, pin_memory=True)
+
+        # Model（与示例容量对齐）
+        h1, h2 = config['layer'][0], config['layer'][1]
+        model = My_Model(input_dim=x_train.shape[1], hidden1=h1, hidden2=h2).to(device)
+
+        # Train one fold
+        best_val = trainer(train_loader, valid_loader, model, config, device, valid_scores)
+        valid_scores.append(best_val)
+
+        # 示例代码里的行为：如果配置了不做K折（no_k_cross=False 表示“要做K折”），则这里 break。
+        if not config['no_k_cross']:
+            break
+
+        # 欠拟合快速跳出（和示例一致的小策略）
+        if best_val > 2:
+            print(f'在第{fold+1}折上欠拟合，提前结束该次训练')
+            break
+
+    print(f'valid_scores: {valid_scores}')
+    return x_test, test_loader
+
+# ====== Main ======
 if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # —— 对齐示例的默认配置（关键差异：仍保留我们框架的函数/类名）——
     config = {
         'seed': 5201314,
-        'select_all': True,
-        'valid_ratio': 0.2,
-        'n_epochs': 1500,
-        'batch_size': 256,  # ← 补上
-        'learning_rate': 1e-3,
-        'weight_decay': 2e-4,
-        'early_stop': 120,  # ← 保留一个，按你想要的值
+        'k': 16,                 # KBest 选择的特征数（核心！）
+        'layer': [16, 16],       # 模型宽度（与示例一致）
+        'optim': 'SGD',          # 'SGD' or 'Adam'
+        'momentum': 0.85,
+        'valid_ratio': 0.05,
+        'n_epochs': 10000,
+        'batch_size': 256,
+        'learning_rate': 1e-5,
+        'weight_decay': 1e-5,
+        'early_stop': 600,
         'save_path': './models/model.ckpt',
-        'log_dir': './runs/hw1_residual_adamw'
+        'no_select_all': True,   # True -> 使用 KBest（对齐示例含义）
+        'no_momentum': False,     # True -> 不启用 momentum
+        'no_normal': True,       # True -> 不做标准化（对齐示例默认）
+        'no_k_cross': False,     # False -> 执行 K 折（对齐示例行为）
+        'no_tensorboard': True, # 是否写入 TensorBoard
     }
 
+    # reproducibility
     same_seed(config['seed'])
 
-    # 1) 读取数据（文件名与你目录一致）
-    # 强健读取：自动嗅探分隔符，兼容常见编码
-    train_data = pd.read_csv(
-        r'E:\MLSpring2025_HW\HW1\covid_train.csv',  # 用绝对路径更稳
-        engine='python',  # 允许自动嗅探分隔符
-        sep=None,  # 让 pandas 用 Sniffer 检测 , ; \t 等
-        encoding='utf-8-sig'  # 兼容带 BOM 的 utf-8
-    ).values
+    # read data
+    training_data = pd.read_csv('./covid_train.csv').values
+    test_data     = pd.read_csv('./covid_test.csv').values
 
-    test_data = pd.read_csv(
-        r'E:\MLSpring2025_HW\HW1\covid_test.csv',
-        engine='python',
-        sep=None,
-        encoding='utf-8-sig'
-    ).values
+    # run (单次；可在外层再做多种子/多次集成)
+    print('开始训练（对齐示例的最小改动版）...')
+    x_test, test_loader = objective()
 
-    # 2) 训练/验证划分
-    train_arr, valid_arr = train_valid_split_np(train_data, config['valid_ratio'], config['seed'])
-    print(f"train_data size: {train_arr.shape}\nvalid_data size: {valid_arr.shape}\ntest_data size: {test_data.shape}")
-
-    # 3) 选特征
-    x_train, x_valid, x_test, y_train, y_valid = select_feat(train_arr, valid_arr, test_data, config['select_all'])
-
-    # 4) 标准化 X
-    scaler = Standardizer()
-    x_train = scaler.fit_transform(x_train)
-    x_valid = scaler.transform(x_valid)
-    x_test = scaler.transform(x_test)
-
-    # 4.1) 标准化 y（只用于训练/验证的损失）
-    ys = YStandardizer()
-    y_train_z = ys.fit(y_train).transform(y_train)
-    y_valid_z = ys.transform(y_valid)
-
-    print(f'number of features: {x_train.shape[1]}')
-
-    # 5) DataLoader
-    train_ds = COVID19Dataset(x_train, y_train_z)
-    valid_ds = COVID19Dataset(x_valid, y_valid_z)
-    test_ds = COVID19Dataset(x_test)
-
-    train_loader = DataLoader(train_ds, batch_size=config['batch_size'], shuffle=True,  pin_memory=True)
-    valid_loader = DataLoader(valid_ds, batch_size=config['batch_size'], shuffle=False, pin_memory=True)
-    test_loader  = DataLoader(test_ds,  batch_size=config['batch_size'], shuffle=False, pin_memory=True)
-
-    # 6) 训练
-    model = My_Model(input_dim=x_train.shape[1]).to(device)
-    trainer(train_loader, valid_loader, model, config, device)
-
-    # 7) 推断（加载最佳权重）
-    best_model = My_Model(input_dim=x_train.shape[1]).to(device)
-    best_model.load_state_dict(
-        torch.load(config['save_path'], map_location=device, weights_only=True)
-    )
-    preds_z = predict(test_loader, best_model, device)  # 标准化空间的输出
-    preds = ys.inverse_transform(preds_z)  # 反标准化回原标度
-
-    # 8) 保存提交文件
-    save_pred(preds, 'pred.csv')
-    print('Saved to pred.csv')
-
-
+    # 推断与保存（加载已保存的最优权重）
+    model = My_Model(input_dim=x_test.shape[1],
+                     hidden1=config['layer'][0],
+                     hidden2=config['layer'][1]).to(device)
+    model.load_state_dict(torch.load(config['save_path'], map_location=device))
+    preds = predict(test_loader, model, device)
+    save_pred(preds, 'submission.csv')
+    print('Saved to submission.csv')
